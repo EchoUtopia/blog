@@ -68,6 +68,9 @@ type UserServiceMock struct {
 	UserFn User(id int) (*User, error)
 }
 
+func (usm *UserServiceMock)User(id int)(*User, error){return usm.UserFn(id)}
+...
+
 ```
 
 单元测试中:
@@ -77,4 +80,4 @@ userMock.UserFn = func(id int) (*User, error){
 	return ***, nil
 }
 ```
-这样就简单明了的mock了。
+这样就简单明了的在我们的mock中构造自己想要的数据了。
