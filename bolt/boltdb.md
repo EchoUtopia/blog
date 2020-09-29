@@ -323,7 +323,9 @@ pending和ids序列化到page中时，会放在一起，在一个pgid数组里�
 
 现由社区维护的 [bbolt](https://github.com/etcd-io/bbolt)，实现了一种 [O(1)复杂度的分配算法](https://medium.com/@Alibaba_Cloud/performance-optimization-of-etcd-in-web-scale-data-scenario-b2eccae5d636)，感兴趣的可以去看下
 
-如果freelist中没查找到，则会使用mmap将映射的范围扩大，大小在1GB以前，会翻倍，达到1GB则增加1GB，这时分配的pageid比meta的pgid大，表明当前已经超过数据库文件大小了，
+如果freelist中没查找到，则会使用mmap将映射的范围扩大，大小在1GB以前，会翻倍，达到1GB则增加1GB。
+
+如果分配的pageid比meta的pgid大，表明当前所有page已经超过数据库文件大小了，
 
 在序列化这些page前，会先扩大数据库文件。
 
@@ -344,7 +346,9 @@ pending里面的page不会里面被视为可用的free pages，只有当对应�
 
 ![](./boltimgs/pages-update.png)
 
-最初事务11看到的b+树的根节点page是4，当事务12更改了page5的数据时，它不会直接更改page5，会将page4、5序列化成node4、5，，然后更改node的数据，
+最初事务11看到的b+树的根节点page是4，当事务12更改了page5的数据时，它不会直接更改page5，会将page4、5序列化成node4、5，
+
+这一过程是cursor遍历节点的时候实现的，然后更改node的数据，
 
 node4是node5的父节点，因为node5最终要序列化到page8，所以node4也会更改，将对应的key指向的pageid变更为8。
 
