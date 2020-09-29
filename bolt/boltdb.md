@@ -20,7 +20,10 @@ boltdb在内存中用data `data     *[maxMapSize]byte`， 来表示这个二进�
 
 后续将介绍b+树是如何存储在这个二进制数组中的。
 
-这个大的二进制数组boltdb用页为单位来进行管理，
+这个大的二进制数组boltdb用页为单位来进行管理，布局如下图：
+
+
+![pages](./boltimgs/pages.png)
 
 boltdb的页和操作系统的页类似，大小一般为4k。
 
@@ -31,7 +34,7 @@ boltdb使用mmap将磁盘文件映射到内存中，这里我简单介绍下mmap
     
     由操作系统和底层硬件mmu配合来翻译到物理地址，
 
-    所以我们在程序中就可以假装访问一段连续的内存一样访问文件内容了，
+    所以我们在程序中就可以直接访问内存来达到读取文件内容的效果了，
     
     当访问的内存页不存在时会触发缺页异常，内核会尝试将文件对应的内容加载到内存页中，
 
@@ -69,7 +72,6 @@ overflow记录了当前page除了自身还占用几个连续的页。
 
 flags标识当前的page类型，boltdb中一共有四个类型page：
 
-![pages](./boltimgs/pages.png)
 
 - 前两个是固定的，meta page，用来管理boltdb元数据
 - freelist page，用来管理空闲page
