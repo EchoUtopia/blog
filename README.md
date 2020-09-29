@@ -1,2 +1,2 @@
-## [boltdb原理探究](./bolt/bolt.md)
+## [boltdb原理探究](./bolt/boltdb.md)
 
