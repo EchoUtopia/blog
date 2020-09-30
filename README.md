@@ -4,4 +4,4 @@
 
 ## [一种简单灵活的代码结构设计](./project_layout_design.md)
 
-## [将外部的底层库再封装一层](./wrap_underlying_lib.md)
+## [为第三方库裹上糖衣](./wrap_underlying_lib.md)
