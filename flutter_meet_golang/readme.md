@@ -216,19 +216,19 @@ include ':app', ':wrapper'
 
 打开app的样子：
 
-[](./flutter1.png)
+![](./flutter1.png)
 
 点击右下角选择图标按钮：
 
-[](./flutter2.png)
+![](./flutter2.png)
 
 展示选择的图片：
 
-[](./flutter3.jpeg)
+![](./flutter3.jpeg)
 
 点击右下角图标按钮，开始生成艺术照：
 
-[](./flutter4.jpeg)
+![](./flutter4.jpeg)
 
 只不过这里又有一个巨坑，一个无法逾越的坑：
 
