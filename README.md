@@ -8,4 +8,4 @@
 
 ## [当flutter遇上golang(2020/11/10)](./flutter_meet_golang/readme.md)
 
-## [转换并展示leetcode问题的输入提高刷题效率(2020/11/12)](https://github.com/EchoUtopia/leetcode-helper/blob/master/README_CN.md)
+## [提高刷leetcode题效率(2020/11/12)](https://github.com/EchoUtopia/leetcode-helper/blob/master/README_CN.md)
