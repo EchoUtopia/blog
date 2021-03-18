@@ -12,3 +12,4 @@
 
 ## [如何优雅高效的缓存第三方静态数据(2021/3/13)](./cache_third_party_static_data.md)
 
+## [三个和尚取水用不完(2021/3/18)](./monk_fetch_water_in_batch.md)
