@@ -124,3 +124,12 @@ func main (){
 ```
 从上面的例子可以看到，batchFetchWaterFunc将水一次性取了回来，这样以前花6个小时的过程现在只需要花10分钟了，明松想下山了，想把他写的遗留代码给优化了。
 
+<p> 
+<DIV >
+作者： <A href="http://github.com/EchoUtopia">EchoUtopia</A> <BR>
+出处： <A href="https://github.com/EchoUtopia/blog/blob/master/monk_fetch_water_in_batch.md">https://github.com/EchoUtopia/blog/blob/master/monk_fetch_water_in_batch.md</A> 
+<BR>原创文章，版权声明：自由转载-非商用-非衍生-保持署名
+<a href= "http://creativecommons.org/licenses/by-nc-nd/3.0/deed.zh"> Creative Commons BY-NC-ND 3.0 </a>。 
+</DIV>
+</p>
+
