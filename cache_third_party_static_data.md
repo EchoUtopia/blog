@@ -139,7 +139,19 @@ func retrieveCity(id int64) (*City, bool, error){
     ***
 
 	bFn := func(ctx context.Context, keys Keys) (map[Key]interface{}, error) {
-		return GetBatchDataFromThirdParty(ctx, keys)
+        cityIds := make([]int64, 0, len(keys))
+        for _, v := range keys {
+            cityIds = append(cityIds, int64(key.(batch.Int64Key)))
+        }   
+        cities, err := GetBatchDataFromThirdParty(ctx, cityIds)
+        if err != nil {
+            return nil, err 
+        }
+        out := make(map[Key]interface{}, len(cities))
+        for _, v := range cities {
+            out[batch.Int64Key(v.CityID)] = v
+        }   
+        return out, nil
 	}
 	b := NewBatch(ctx, bFn, WithBatchSpan(100), WithCache(DefaultCache()))
 	for user := range users {
