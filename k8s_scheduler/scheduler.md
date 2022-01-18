@@ -14,7 +14,7 @@ scheduler是k8s一个核心的组件，它监测集群中创建的但是还没�
         一个pod可能会筛选满足条件的node，通过label实现，灵活实现各种筛选条件。
 - nodeAffinity
 
-        节点亲和性，相比nodeSelector来说是软需求/偏好。
+        节点亲和性，相比nodeSelector来说可以实现软需求/偏好。
         亲和性也分软亲和/硬亲和，硬亲和和nodeSelector类似，但是提供了比nodeSelector更强大的筛选语法。
 
 - podAffinity/podAntiAffinity
@@ -380,5 +380,897 @@ func (p *PriorityQueue) flushUnschedulableQLeftover() {
 ![](./img/queue.png)
 
 
+### 调度逻辑
 
+调度逻辑主流程在sched.scheduleOne函数里，这个函数比较长，我会截去不重要的部分：
+
+
+```golang
+
+// scheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
+func (sched *Scheduler) scheduleOne(ctx context.Context) {
+	// 从队列里取出pod
+	podInfo := sched.NextPod()
+	// pod could be nil when schedulerQueue is closed
+	if podInfo == nil || podInfo.Pod == nil {
+		return
+	}
+	// 如果pod已被删除或者已经assumed，不做调度处理
+	if sched.skipPodSchedule(fwk, pod) {
+		return
+	}
+
+	// Synchronously attempt to find a fit for the pod.
+	start := time.Now()
+	state := framework.NewCycleState()
+	// Initialize an empty podsToActivate struct, which will be filled up by plugins or stay empty.
+	podsToActivate := framework.NewPodsToActivate()
+	state.Write(framework.PodsToActivateKey, podsToActivate)
+
+	schedulingCycleCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	scheduleResult, err := sched.Algorithm.Schedule(schedulingCycleCtx, sched.Extenders, fwk, state, pod)
+	if err != nil {
+		// Schedule() may have failed because the pod would not fit on any host, so we try to
+		// preempt, with the expectation that the next time the pod is tried for scheduling it
+		// will fit due to the preemption. It is also possible that a different pod will schedule
+		// into the resources that were preempted, but this is harmless.
+		var nominatingInfo *framework.NominatingInfo
+		if fitError, ok := err.(*framework.FitError); ok {
+			if !fwk.HasPostFilterPlugins() {
+				klog.V(3).InfoS("No PostFilter plugins are registered, so no preemption will be performed")
+			} else {
+				// Run PostFilter plugins to try to make the pod schedulable in a future scheduling cycle.
+				// 试图抢占其他pod
+				result, status := fwk.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatusMap)
+				if status.Code() == framework.Error {
+					klog.ErrorS(nil, "Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", status)
+				} else {
+					klog.V(5).InfoS("Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", status)
+				}
+				if result != nil {
+					nominatingInfo = result.NominatingInfo
+				}
+			}
+		}
+		// 这个函数会根据nominatingInfo结果将pod放入不同队列
+		sched.handleSchedulingFailure(fwk, podInfo, err, v1.PodReasonUnschedulable, nominatingInfo)
+		return
+	}
+	
+	// Tell the cache to assume that a pod now is running on a given node, even though it hasn't been bound yet.
+	// This allows us to keep scheduling without waiting on binding to occur.
+	assumedPodInfo := podInfo.DeepCopy()
+	assumedPod := assumedPodInfo.Pod
+	// assume modifies `assumedPod` by setting NodeName=scheduleResult.SuggestedHost
+	err = sched.assume(assumedPod, scheduleResult.SuggestedHost)
+	if err != nil {
+		// This is most probably result of a BUG in retrying logic.
+		// We report an error here so that pod scheduling can be retried.
+		// This relies on the fact that Error will check if the pod has been bound
+		// to a node and if so will not add it back to the unscheduled pods queue
+		// (otherwise this would cause an infinite loop).
+		sched.handleSchedulingFailure(fwk, assumedPodInfo, err, SchedulerError, clearNominatedNode)
+		return
+	}
+
+	// Run the Reserve method of reserve plugins.
+	// 预留资源
+	if sts := fwk.RunReservePluginsReserve(schedulingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost); !sts.IsSuccess() {
+		
+		fwk.RunReservePluginsUnreserve(schedulingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
+		// 将pod从cache中删除，如果已assumed，同样移除出assumed pods集合中
+		if forgetErr := sched.SchedulerCache.ForgetPod(assumedPod); forgetErr != nil {
+			klog.ErrorS(forgetErr, "Scheduler cache ForgetPod failed")
+		}
+		sched.handleSchedulingFailure(fwk, assumedPodInfo, sts.AsError(), SchedulerError, clearNominatedNode)
+		return
+	}
+
+	// Run "permit" plugins.
+	runPermitStatus := fwk.RunPermitPlugins(schedulingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
+	if runPermitStatus.Code() != framework.Wait && !runPermitStatus.IsSuccess() {
+		var reason string
+		if runPermitStatus.IsUnschedulable() {
+			metrics.PodUnschedulable(fwk.ProfileName(), metrics.SinceInSeconds(start))
+			reason = v1.PodReasonUnschedulable
+		} else {
+			metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
+			reason = SchedulerError
+		}
+		// One of the plugins returned status different than success or wait.
+		fwk.RunReservePluginsUnreserve(schedulingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
+		if forgetErr := sched.SchedulerCache.ForgetPod(assumedPod); forgetErr != nil {
+			klog.ErrorS(forgetErr, "Scheduler cache ForgetPod failed")
+		}
+		sched.handleSchedulingFailure(fwk, assumedPodInfo, runPermitStatus.AsError(), reason, clearNominatedNode)
+		return
+	}
+
+	// At the end of a successful scheduling cycle, pop and move up Pods if needed.
+	if len(podsToActivate.Map) != 0 {
+		sched.SchedulingQueue.Activate(podsToActivate.Map)
+		// Clear the entries after activation.
+		podsToActivate.Map = make(map[string]*v1.Pod)
+	}
+
+	// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
+	// 异步绑定操作
+	go func() {
+		bindingCycleCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		waitOnPermitStatus := fwk.WaitOnPermit(bindingCycleCtx, assumedPod)
+		if !waitOnPermitStatus.IsSuccess() {
+			var reason string
+			if waitOnPermitStatus.IsUnschedulable() {
+				reason = v1.PodReasonUnschedulable
+			} else {
+				reason = SchedulerError
+			}
+			// trigger un-reserve plugins to clean up state associated with the reserved Pod
+			fwk.RunReservePluginsUnreserve(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
+			if forgetErr := sched.SchedulerCache.ForgetPod(assumedPod); forgetErr != nil {
+				klog.ErrorS(forgetErr, "scheduler cache ForgetPod failed")
+			} else {
+				// "Forget"ing an assumed Pod in binding cycle should be treated as a PodDelete event,
+				// as the assumed Pod had occupied a certain amount of resources in scheduler cache.
+				// TODO(#103853): de-duplicate the logic.
+				// Avoid moving the assumed Pod itself as it's always Unschedulable.
+				// It's intentional to "defer" this operation; otherwise MoveAllToActiveOrBackoffQueue() would
+				// update `q.moveRequest` and thus move the assumed pod to backoffQ anyways.
+				defer sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(internalqueue.AssignedPodDelete, func(pod *v1.Pod) bool {
+					return assumedPod.UID != pod.UID
+				})
+			}
+			sched.handleSchedulingFailure(fwk, assumedPodInfo, waitOnPermitStatus.AsError(), reason, clearNominatedNode)
+			return
+		}
+
+		// Run "prebind" plugins.
+		preBindStatus := fwk.RunPreBindPlugins(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
+		if !preBindStatus.IsSuccess() {
+			metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
+			// trigger un-reserve plugins to clean up state associated with the reserved Pod
+			fwk.RunReservePluginsUnreserve(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
+			if forgetErr := sched.SchedulerCache.ForgetPod(assumedPod); forgetErr != nil {
+				klog.ErrorS(forgetErr, "scheduler cache ForgetPod failed")
+			} else {
+				// "Forget"ing an assumed Pod in binding cycle should be treated as a PodDelete event,
+				// as the assumed Pod had occupied a certain amount of resources in scheduler cache.
+				// TODO(#103853): de-duplicate the logic.
+				sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(internalqueue.AssignedPodDelete, nil)
+			}
+			sched.handleSchedulingFailure(fwk, assumedPodInfo, preBindStatus.AsError(), SchedulerError, clearNominatedNode)
+			return
+		}
+
+		err := sched.bind(bindingCycleCtx, fwk, assumedPod, scheduleResult.SuggestedHost, state)
+		if err != nil {
+			metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
+			// trigger un-reserve plugins to clean up state associated with the reserved Pod
+			fwk.RunReservePluginsUnreserve(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
+			if err := sched.SchedulerCache.ForgetPod(assumedPod); err != nil {
+				klog.ErrorS(err, "scheduler cache ForgetPod failed")
+			} else {
+				// "Forget"ing an assumed Pod in binding cycle should be treated as a PodDelete event,
+				// as the assumed Pod had occupied a certain amount of resources in scheduler cache.
+				// TODO(#103853): de-duplicate the logic.
+				sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(internalqueue.AssignedPodDelete, nil)
+			}
+			sched.handleSchedulingFailure(fwk, assumedPodInfo, fmt.Errorf("binding rejected: %w", err), SchedulerError, clearNominatedNode)
+		} else {
+			// Calculating nodeResourceString can be heavy. Avoid it if klog verbosity is below 2.
+			if klog.V(2).Enabled() {
+				klog.InfoS("Successfully bound pod to node", "pod", klog.KObj(pod), "node", scheduleResult.SuggestedHost, "evaluatedNodes", scheduleResult.EvaluatedNodes, "feasibleNodes", scheduleResult.FeasibleNodes)
+			}
+			metrics.PodScheduled(fwk.ProfileName(), metrics.SinceInSeconds(start))
+			metrics.PodSchedulingAttempts.Observe(float64(podInfo.Attempts))
+			metrics.PodSchedulingDuration.WithLabelValues(getAttemptsLabel(podInfo)).Observe(metrics.SinceInSeconds(podInfo.InitialAttemptTimestamp))
+
+			// Run "postbind" plugins.
+			fwk.RunPostBindPlugins(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
+
+			// At the end of a successful binding cycle, move up Pods if needed.
+			if len(podsToActivate.Map) != 0 {
+				sched.SchedulingQueue.Activate(podsToActivate.Map)
+				// Unlike the logic in scheduling cycle, we don't bother deleting the entries
+				// as `podsToActivate.Map` is no longer consumed.
+			}
+		}
+	}()
+}
+
+```
+
+可以看到上述函数中主要执行了：
+
+`sched.NextPod()`
+
+`sched.Algorithm.Schedule(schedulingCycleCtx, sched.Extenders, fwk, state, pod)`
+
+
+调度失败执行： `fwk.RunPostFilterPlugins()`
+
+否则走如下流程：`sched.assume(assumedPod, scheduleResult.SuggestedHost)`
+
+`fwk.RunReservePluginsReserve(schedulingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)`
+
+`fwk.RunPermitPlugins(schedulingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)`
+
+异步执行以下流程：
+
+`fwk.RunPreBindPlugins(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)`
+
+`sched.bind(bindingCycleCtx, fwk, assumedPod, scheduleResult.SuggestedHost, state)`
+
+`fwk.RunPostBindPlugins(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)`
+
+可以看到上面的函数还差 `predicates`和`prioritize` 两个重要流程，这两个流程在`sched.Algorithm.Schedule`函数里：
+
+```golang
+
+// Schedule tries to schedule the given pod to one of the nodes in the node list.
+// If it succeeds, it will return the name of the node.
+// If it fails, it will return a FitError error with reasons.
+func (g *genericScheduler) Schedule(ctx context.Context, extenders []framework.Extender, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod) (result ScheduleResult, err error) {
+
+	// 通过增量更新生成一个cache的快照，这样能保证整个预选和优选流程读的数据保持一致性
+	if err := g.snapshot(); err != nil {
+		return result, err
+	}
+
+	if g.nodeInfoSnapshot.NumNodes() == 0 {
+		return result, ErrNoNodesAvailable
+	}
+	// 通过preFilter, filter两个流程筛选掉不满足条件的nodes
+	feasibleNodes, diagnosis, err := g.findNodesThatFitPod(ctx, extenders, fwk, state, pod)
+	if err != nil {
+		return result, err
+	}
+
+	if len(feasibleNodes) == 0 {
+		return result, &framework.FitError{
+			Pod:         pod,
+			NumAllNodes: g.nodeInfoSnapshot.NumNodes(),
+			Diagnosis:   diagnosis,
+		}
+	}
+
+	// When only one node after predicate, just use it.
+	if len(feasibleNodes) == 1 {
+		return ScheduleResult{
+			SuggestedHost:  feasibleNodes[0].Name,
+			EvaluatedNodes: 1 + len(diagnosis.NodeToStatusMap),
+			FeasibleNodes:  1,
+		}, nil
+	}
+	// 通过preScore, score两个流程为这些nodes打分
+	priorityList, err := prioritizeNodes(ctx, extenders, fwk, state, pod, feasibleNodes)
+	if err != nil {
+		return result, err
+	}
+	// 选出最高分的nodes，如果有多个相同的最高分nodes，随机选一个
+	host, err := g.selectHost(priorityList)
+	trace.Step("Prioritizing done")
+
+	return ScheduleResult{
+		SuggestedHost:  host,
+		EvaluatedNodes: len(feasibleNodes) + len(diagnosis.NodeToStatusMap),
+		FeasibleNodes:  len(feasibleNodes),
+	}, err
+}
+```
+
+
+`g.findNodesThatFitPod` 执行了preFilter和filter两个扩展点流程。
+
+```golang
+// Filters the nodes to find the ones that fit the pod based on the framework
+// filter plugins and filter extenders.
+func (g *genericScheduler) findNodesThatFitPod(ctx context.Context, extenders []framework.Extender, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod) ([]*v1.Node, framework.Diagnosis, error) {
+	diagnosis := framework.Diagnosis{
+		NodeToStatusMap:      make(framework.NodeToStatusMap),
+		UnschedulablePlugins: sets.NewString(),
+	}
+
+	// Run "prefilter" plugins.
+	// status会返回执行失败的插件，当以后相关资源变化时，则这个pod可能会因此可调度，会尝试重新调度它。
+	s := fwk.RunPreFilterPlugins(ctx, state, pod)
+	allNodes, err := g.nodeInfoSnapshot.NodeInfos().List()
+	if err != nil {
+		return nil, diagnosis, err
+	}
+	if !s.IsSuccess() {
+		if !s.IsUnschedulable() {
+			return nil, diagnosis, s.AsError()
+		}
+		// All nodes will have the same status. Some non trivial refactoring is
+		// needed to avoid this copy.
+		for _, n := range allNodes {
+			diagnosis.NodeToStatusMap[n.Node().Name] = s
+		}
+		// Status satisfying IsUnschedulable() gets injected into diagnosis.UnschedulablePlugins.
+		diagnosis.UnschedulablePlugins.Insert(s.FailedPlugin())
+		return nil, diagnosis, nil
+	}
+
+	// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
+	// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
+	// 这个pod可能是执行了抢占操作被重新调度了，如果是，则没必要再为很多nodes执行过滤条件了，只需要再次判断抢占的node是否通过筛选条件。
+	if len(pod.Status.NominatedNodeName) > 0 {
+		feasibleNodes, err := g.evaluateNominatedNode(ctx, extenders, pod, fwk, state, diagnosis)
+		if err != nil {
+			klog.ErrorS(err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
+		}
+		// Nominated node passes all the filters, scheduler is good to assign this node to the pod.
+		if len(feasibleNodes) != 0 {
+			return feasibleNodes, diagnosis, nil
+		}
+	}
+	// 并发为每个node判断是否可调度，为了减少性能消耗，会选择一部分nodes来判断，感兴趣的读者可以自行查看这块逻辑
+	feasibleNodes, err := g.findNodesThatPassFilters(ctx, fwk, state, pod, diagnosis, allNodes)
+	if err != nil {
+		return nil, diagnosis, err
+	}
+	// 再调用extender接口，再次过滤
+	feasibleNodes, err = findNodesThatPassExtenders(extenders, pod, feasibleNodes, diagnosis.NodeToStatusMap)
+	if err != nil {
+		return nil, diagnosis, err
+	}
+	return feasibleNodes, diagnosis, nil
+}
+
+```
+
+`prioritizeNodes` 执行了framework的preScore和score两个扩展点逻辑。
+
+```golang
+
+// prioritizeNodes prioritizes the nodes by running the score plugins,
+// which return a score for each node from the call to RunScorePlugins().
+// The scores from each plugin are added together to make the score for that node, then
+// any extenders are run as well.
+// All scores are finally combined (added) to get the total weighted scores of all nodes
+func prioritizeNodes(
+	ctx context.Context,
+	extenders []framework.Extender,
+	fwk framework.Framework,
+	state *framework.CycleState,
+	pod *v1.Pod,
+	nodes []*v1.Node,
+) (framework.NodeScoreList, error) {
+	// If no priority configs are provided, then all nodes will have a score of one.
+	// This is required to generate the priority list in the required format
+	if len(extenders) == 0 && !fwk.HasScorePlugins() {
+		result := make(framework.NodeScoreList, 0, len(nodes))
+		for i := range nodes {
+			result = append(result, framework.NodeScore{
+				Name:  nodes[i].Name,
+				Score: 1,
+			})
+		}
+		return result, nil
+	}
+
+	// Run PreScore plugins.
+	// 执行preScore插件，为score步骤准备好对应的数据
+	preScoreStatus := fwk.RunPreScorePlugins(ctx, state, pod, nodes)
+	if !preScoreStatus.IsSuccess() {
+		return nil, preScoreStatus.AsError()
+	}
+
+	// Run the Score plugins.
+	// 执行score插件，并行通过每个插件会为每个node打分，标准化打分并将权重计算进去
+	scoresMap, scoreStatus := fwk.RunScorePlugins(ctx, state, pod, nodes)
+	if !scoreStatus.IsSuccess() {
+		return nil, scoreStatus.AsError()
+	}
+
+	// Summarize all scores.
+	result := make(framework.NodeScoreList, 0, len(nodes))
+
+	// 打分汇总
+	for i := range nodes {
+		result = append(result, framework.NodeScore{Name: nodes[i].Name, Score: 0})
+		for j := range scoresMap {
+			result[i].Score += scoresMap[j][i].Score
+		}
+	}
+
+	if len(extenders) != 0 && nodes != nil {
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		combinedScores := make(map[string]int64, len(nodes))
+		for i := range extenders {
+			if !extenders[i].IsInterested(pod) {
+				continue
+			}
+			wg.Add(1)
+			go func(extIndex int) {
+				prioritizedList, weight, err := extenders[extIndex].Prioritize(pod, nodes)
+				if err != nil {
+					// Prioritization errors from extender can be ignored, let k8s/other extenders determine the priorities
+					return
+				}
+				mu.Lock()
+				for i := range *prioritizedList {
+					host, score := (*prioritizedList)[i].Host, (*prioritizedList)[i].Score
+
+					combinedScores[host] += score * weight
+				}
+				mu.Unlock()
+			}(i)
+		}
+		// wait for all go routines to finish
+		wg.Wait()
+		// 将插件打分和extender打分汇总
+		for i := range result {
+			// MaxExtenderPriority may diverge from the max priority used in the scheduler and defined by MaxNodeScore,
+			// therefore we need to scale the score returned by extenders to the score range used by the scheduler.
+			result[i].Score += combinedScores[result[i].Name] * (framework.MaxNodeScore / extenderv1.MaxExtenderPriority)
+		}
+	}
+
+	return result, nil
+}
+```
+
+
+### framework
+
+接下来我们来看一个插件是如何来过滤和打分的吧。
+
+```golang
+
+
+// Framework manages the set of plugins in use by the scheduling framework.
+// Configured plugins are called at specified points in a scheduling context.
+type Framework interface {
+	Handle
+	// QueueSortFunc returns the function to sort pods in scheduling queue
+	QueueSortFunc() LessFunc
+
+	// RunPreFilterPlugins runs the set of configured PreFilter plugins. It returns
+	// *Status and its code is set to non-success if any of the plugins returns
+	// anything but Success. If a non-success status is returned, then the scheduling
+	// cycle is aborted.
+	RunPreFilterPlugins(ctx context.Context, state *CycleState, pod *v1.Pod) *Status
+
+	// RunPostFilterPlugins runs the set of configured PostFilter plugins.
+	// PostFilter plugins can either be informational, in which case should be configured
+	// to execute first and return Unschedulable status, or ones that try to change the
+	// cluster state to make the pod potentially schedulable in a future scheduling cycle.
+	RunPostFilterPlugins(ctx context.Context, state *CycleState, pod *v1.Pod, filteredNodeStatusMap NodeToStatusMap) (*PostFilterResult, *Status)
+
+	// RunPreBindPlugins runs the set of configured PreBind plugins. It returns
+	// *Status and its code is set to non-success if any of the plugins returns
+	// anything but Success. If the Status code is "Unschedulable", it is
+	// considered as a scheduling check failure, otherwise, it is considered as an
+	// internal error. In either case the pod is not going to be bound.
+	RunPreBindPlugins(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string) *Status
+
+	// RunPostBindPlugins runs the set of configured PostBind plugins.
+	RunPostBindPlugins(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string)
+
+	// RunReservePluginsReserve runs the Reserve method of the set of
+	// configured Reserve plugins. If any of these calls returns an error, it
+	// does not continue running the remaining ones and returns the error. In
+	// such case, pod will not be scheduled.
+	RunReservePluginsReserve(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string) *Status
+
+	// RunReservePluginsUnreserve runs the Unreserve method of the set of
+	// configured Reserve plugins.
+	RunReservePluginsUnreserve(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string)
+
+	// RunPermitPlugins runs the set of configured Permit plugins. If any of these
+	// plugins returns a status other than "Success" or "Wait", it does not continue
+	// running the remaining plugins and returns an error. Otherwise, if any of the
+	// plugins returns "Wait", then this function will create and add waiting pod
+	// to a map of currently waiting pods and return status with "Wait" code.
+	// Pod will remain waiting pod for the minimum duration returned by the Permit plugins.
+	RunPermitPlugins(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string) *Status
+
+	// WaitOnPermit will block, if the pod is a waiting pod, until the waiting pod is rejected or allowed.
+	
+	WaitOnPermit(ctx context.Context, pod *v1.Pod) *Status
+
+	// RunBindPlugins runs the set of configured Bind plugins. A Bind plugin may choose
+	// whether or not to handle the given Pod. If a Bind plugin chooses to skip the
+	// binding, it should return code=5("skip") status. Otherwise, it should return "Error"
+	// or "Success". If none of the plugins handled binding, RunBindPlugins returns
+	// code=5("skip") status.
+	RunBindPlugins(ctx context.Context, state *CycleState, pod *v1.Pod, nodeName string) *Status
+
+	// HasFilterPlugins returns true if at least one Filter plugin is defined.
+	HasFilterPlugins() bool
+
+	// HasPostFilterPlugins returns true if at least one PostFilter plugin is defined.
+	HasPostFilterPlugins() bool
+
+	// HasScorePlugins returns true if at least one Score plugin is defined.
+	HasScorePlugins() bool
+
+	// ListPlugins returns a map of extension point name to list of configured Plugins.
+	ListPlugins() *config.Plugins
+
+	// ProfileName returns the profile name associated to this framework.
+	ProfileName() string
+}
+
+
+type frameworkImpl struct {
+	registry             Registry
+	snapshotSharedLister framework.SharedLister
+	waitingPods          *waitingPodsMap
+	scorePluginWeight    map[string]int
+	queueSortPlugins     []framework.QueueSortPlugin
+	preFilterPlugins     []framework.PreFilterPlugin
+	filterPlugins        []framework.FilterPlugin
+	postFilterPlugins    []framework.PostFilterPlugin
+	preScorePlugins      []framework.PreScorePlugin
+	scorePlugins         []framework.ScorePlugin
+	reservePlugins       []framework.ReservePlugin
+	preBindPlugins       []framework.PreBindPlugin
+	bindPlugins          []framework.BindPlugin
+	postBindPlugins      []framework.PostBindPlugin
+	permitPlugins        []framework.PermitPlugin
+
+	clientSet       clientset.Interface
+	kubeConfig      *restclient.Config
+	eventRecorder   events.EventRecorder
+	informerFactory informers.SharedInformerFactory
+
+	metricsRecorder *metricsRecorder
+	profileName     string
+
+	extenders []framework.Extender
+	framework.PodNominator
+
+	parallelizer parallelize.Parallelizer
+
+	// Indicates that RunFilterPlugins should accumulate all failed statuses and not return
+	// after the first failure.
+	runAllFilters bool
+}
+```
+
+`frameworkImpl`是`Framework`接口的具体实现，可以看到，不同的插件都被注册到了`frameworkImpl`里面。
+
+
+接下来我们看一个插件的实现，让我们对插件具体执行有更清晰的了解，我们来看下一个简单的插件：nodeAffinity，它既参与了预选，又参与了优选：
+
+
+```golang
+
+
+// Name returns name of the plugin. It is used in logs, etc.
+func (pl *NodeAffinity) Name() string {
+	return Name
+}
+
+type preFilterState struct {
+	requiredNodeSelectorAndAffinity nodeaffinity.RequiredNodeAffinity
+}
+
+// Clone just returns the same state because it is not affected by pod additions or deletions.
+func (s *preFilterState) Clone() framework.StateData {
+	return s
+}
+
+// EventsToRegister returns the possible events that may make a Pod
+// failed by this plugin schedulable.
+func (pl *NodeAffinity) EventsToRegister() []framework.ClusterEvent {
+	return []framework.ClusterEvent{
+		{Resource: framework.Node, ActionType: framework.Add | framework.UpdateNodeLabel},
+	}
+}
+
+// PreFilter builds and writes cycle state used by Filter.
+// 将filter需要的数据写入state中
+func (pl *NodeAffinity) PreFilter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod) *framework.Status {
+	state := &preFilterState{requiredNodeSelectorAndAffinity: nodeaffinity.GetRequiredNodeAffinity(pod)}
+	cycleState.Write(preFilterStateKey, state)
+	return nil
+}
+
+// PreFilterExtensions not necessary for this plugin as state doesn't depend on pod additions or deletions.
+func (pl *NodeAffinity) PreFilterExtensions() framework.PreFilterExtensions {
+	return nil
+}
+
+// Filter checks if the Node matches the Pod .spec.affinity.nodeAffinity and
+// the plugin's added affinity.
+func (pl *NodeAffinity) Filter(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+	node := nodeInfo.Node()
+	if node == nil {
+		return framework.NewStatus(framework.Error, "node not found")
+	}
+	...
+	// 将prefilter写入的数据取出
+	s, err := getPreFilterState(state)
+	if err != nil {
+		// Fallback to calculate requiredNodeSelector and requiredNodeAffinity
+		// here when PreFilter is disabled.
+		s = &preFilterState{requiredNodeSelectorAndAffinity: nodeaffinity.GetRequiredNodeAffinity(pod)}
+	}
+
+	// Ignore parsing errors for backwards compatibility.
+	// 检查pod的requiredNodeSelectorAndAffinity node是否匹配
+	match, _ := s.requiredNodeSelectorAndAffinity.Match(node)
+	if !match {
+		return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReasonPod)
+	}
+
+	return nil
+}
+
+// preScoreState computed at PreScore and used at Score.
+type preScoreState struct {
+	preferredNodeAffinity *nodeaffinity.PreferredSchedulingTerms
+}
+
+// Clone implements the mandatory Clone interface. We don't really copy the data since
+// there is no need for that.
+func (s *preScoreState) Clone() framework.StateData {
+	return s
+}
+
+// PreScore builds and writes cycle state used by Score and NormalizeScore.
+// 为score写入preferredNodeAffinity数据
+func (pl *NodeAffinity) PreScore(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) *framework.Status {
+	if len(nodes) == 0 {
+		return nil
+	}
+	preferredNodeAffinity, err := getPodPreferredNodeAffinity(pod)
+	if err != nil {
+		return framework.AsStatus(err)
+	}
+	state := &preScoreState{
+		preferredNodeAffinity: preferredNodeAffinity,
+	}
+	cycleState.Write(preScoreStateKey, state)
+	return nil
+}
+
+// Score returns the sum of the weights of the terms that match the Node.
+// Terms came from the Pod .spec.affinity.nodeAffinity and from the plugin's
+// default affinity.
+func (pl *NodeAffinity) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
+	nodeInfo, err := pl.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
+	if err != nil {
+		return 0, framework.AsStatus(fmt.Errorf("getting node %q from Snapshot: %w", nodeName, err))
+	}
+
+	node := nodeInfo.Node()
+
+	var count int64
+	if pl.addedPrefSchedTerms != nil {
+		count += pl.addedPrefSchedTerms.Score(node)
+	}
+	// 取出preScore写入的数据
+	s, err := getPreScoreState(state)
+	if err != nil {
+		// Fallback to calculate preferredNodeAffinity here when PreScore is disabled.
+		preferredNodeAffinity, err := getPodPreferredNodeAffinity(pod)
+		if err != nil {
+			return 0, framework.AsStatus(err)
+		}
+		s = &preScoreState{
+			preferredNodeAffinity: preferredNodeAffinity,
+		}
+	}
+	// 打分：将所有的preferredNodeAffinity匹配的权重相加
+	if s.preferredNodeAffinity != nil {
+		count += s.preferredNodeAffinity.Score(node)
+	}
+
+	return count, nil
+}
+
+// NormalizeScore invoked after scoring all nodes.
+// 打分标准化
+func (pl *NodeAffinity) NormalizeScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
+	return helper.DefaultNormalizeScore(framework.MaxNodeScore, false, scores)
+}
+
+// ScoreExtensions of the Score plugin.
+func (pl *NodeAffinity) ScoreExtensions() framework.ScoreExtensions {
+	return pl
+}
+
+// New initializes a new plugin and returns it.
+func New(plArgs runtime.Object, h framework.Handle) (framework.Plugin, error) {
+	args, err := getArgs(plArgs)
+	if err != nil {
+		return nil, err
+	}
+	pl := &NodeAffinity{
+		handle: h,
+	}
+	if args.AddedAffinity != nil {
+		if ns := args.AddedAffinity.RequiredDuringSchedulingIgnoredDuringExecution; ns != nil {
+			pl.addedNodeSelector, err = nodeaffinity.NewNodeSelector(ns)
+			if err != nil {
+				return nil, fmt.Errorf("parsing addedAffinity.requiredDuringSchedulingIgnoredDuringExecution: %w", err)
+			}
+		}
+		// TODO: parse requiredDuringSchedulingRequiredDuringExecution when it gets added to the API.
+		if terms := args.AddedAffinity.PreferredDuringSchedulingIgnoredDuringExecution; len(terms) != 0 {
+			pl.addedPrefSchedTerms, err = nodeaffinity.NewPreferredSchedulingTerms(terms)
+			if err != nil {
+				return nil, fmt.Errorf("parsing addedAffinity.preferredDuringSchedulingIgnoredDuringExecution: %w", err)
+			}
+		}
+	}
+	return pl, nil
+}
+
+func getArgs(obj runtime.Object) (config.NodeAffinityArgs, error) {
+	ptr, ok := obj.(*config.NodeAffinityArgs)
+	if !ok {
+		return config.NodeAffinityArgs{}, fmt.Errorf("args are not of type NodeAffinityArgs, got %T", obj)
+	}
+	return *ptr, validation.ValidateNodeAffinityArgs(nil, ptr)
+}
+
+func getPodPreferredNodeAffinity(pod *v1.Pod) (*nodeaffinity.PreferredSchedulingTerms, error) {
+	affinity := pod.Spec.Affinity
+	if affinity != nil && affinity.NodeAffinity != nil && affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution != nil {
+		return nodeaffinity.NewPreferredSchedulingTerms(affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution)
+	}
+	return nil, nil
+}
+
+func getPreScoreState(cycleState *framework.CycleState) (*preScoreState, error) {
+	c, err := cycleState.Read(preScoreStateKey)
+	if err != nil {
+		return nil, fmt.Errorf("reading %q from cycleState: %w", preScoreStateKey, err)
+	}
+
+	s, ok := c.(*preScoreState)
+	if !ok {
+		return nil, fmt.Errorf("invalid PreScore state, got type %T", c)
+	}
+	return s, nil
+}
+
+func getPreFilterState(cycleState *framework.CycleState) (*preFilterState, error) {
+	c, err := cycleState.Read(preFilterStateKey)
+	if err != nil {
+		return nil, fmt.Errorf("reading %q from cycleState: %v", preFilterStateKey, err)
+	}
+
+	s, ok := c.(*preFilterState)
+	if !ok {
+		return nil, fmt.Errorf("invalid PreFilter state, got type %T", c)
+	}
+	return s, nil
+}
+
+```
+
+以上将成功调度的流程都大体过了一遍，接下来我们看下调度失败时试图抢占的逻辑：
+
+
+### 抢占
+
+
+```golang
+
+
+// PostFilter invoked at the postFilter extension point.
+func (pl *DefaultPreemption) PostFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod, m framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+	defer func() {
+		metrics.PreemptionAttempts.Inc()
+	}()
+
+	pe := preemption.Evaluator{
+		PluginName: names.DefaultPreemption,
+		Handler:    pl.fh,
+		PodLister:  pl.podLister,
+		PdbLister:  pl.pdbLister,
+		State:      state,
+		Interface:  pl,
+	}
+	return pe.Preempt(ctx, pod, m)
+}
+
+```
+
+可以看到抢占逻辑时在PostFilter扩展点中执行的。
+
+
+```golang
+
+// Preempt returns a PostFilterResult carrying suggested nominatedNodeName, along with a Status.
+// The semantics of returned <PostFilterResult, Status> varies on different scenarios:
+// - <nil, Error>. This denotes it's a transient/rare error that may be self-healed in future cycles.
+// - <nil, Unschedulable>. This status is mostly as expected like the preemptor is waiting for the
+//   victims to be fully terminated.
+// - In both cases above, a nil PostFilterResult is returned to keep the pod's nominatedNodeName unchanged.
+//
+// - <non-nil PostFilterResult, Unschedulable>. It indicates the pod cannot be scheduled even with preemption.
+//   In this case, a non-nil PostFilterResult is returned and result.NominatingMode instructs how to deal with
+//   the nominatedNodeName.
+// - <non-nil PostFilterResult}, Success>. It's the regular happy path
+//   and the non-empty nominatedNodeName will be applied to the preemptor pod.
+func (ev *Evaluator) Preempt(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+	// 0) Fetch the latest version of <pod>.
+	// It's safe to directly fetch pod here. Because the informer cache has already been
+	// initialized when creating the Scheduler obj, i.e., factory.go#MakeDefaultErrorFunc().
+	// However, tests may need to manually initialize the shared pod informer.
+	podNamespace, podName := pod.Namespace, pod.Name
+	pod, err := ev.PodLister.Pods(pod.Namespace).Get(pod.Name)
+	if err != nil {
+		klog.ErrorS(err, "Getting the updated preemptor pod object", "pod", klog.KRef(podNamespace, podName))
+		return nil, framework.AsStatus(err)
+	}
+
+	// 1) Ensure the preemptor is eligible to preempt other pods.
+	// 确保pod有资格抢占其他pod，比如当前pod已执行抢占操作，且抢占的节点上有优先级更低的pod正在被驱逐过程中，则不再抢占，可能当前pod正在等待victims退出。
+	if !ev.PodEligibleToPreemptOthers(pod, m[pod.Status.NominatedNodeName]) {
+		klog.V(5).InfoS("Pod is not eligible for more preemption", "pod", klog.KObj(pod))
+		return nil, framework.NewStatus(framework.Unschedulable)
+	}
+
+	// 2) Find all preemption candidates.
+	// 筛选掉不可调度的nodes，通过dryRunPreemption函数生成候选节点，候选节点nodes附带pdb数据和victim pods数据
+	candidates, nodeToStatusMap, err := ev.findCandidates(ctx, pod, m)
+	if err != nil && len(candidates) == 0 {
+		return nil, framework.AsStatus(err)
+	}
+
+	// Return a FitError only when there are no candidates that fit the pod.
+	if len(candidates) == 0 {
+		fitError := &framework.FitError{
+			Pod:         pod,
+			NumAllNodes: len(nodeToStatusMap),
+			Diagnosis: framework.Diagnosis{
+				NodeToStatusMap: nodeToStatusMap,
+				// Leave FailedPlugins as nil as it won't be used on moving Pods.
+			},
+		}
+		// Specify nominatedNodeName to clear the pod's nominatedNodeName status, if applicable.
+		return framework.NewPostFilterResultWithNominatedNode(""), framework.NewStatus(framework.Unschedulable, fitError.Error())
+	}
+
+	// 3) Interact with registered Extenders to filter out some candidates if needed.
+
+	candidates, status := ev.callExtenders(pod, candidates)
+	if !status.IsSuccess() {
+		return nil, status
+	}
+
+	// 4) Find the best candidate.
+	// 选出一个最优的node，经过以下条件层层筛选：
+
+	// 选择一个PBD违规数量最少的
+	// 选择一个包含最高优先级牺牲者最小的
+	// 所有牺牲者的优先级总和最小的
+	// 最少牺牲者的
+	// 拥有所有最高优先级的牺牲者最迟才启动的
+	bestCandidate := ev.SelectCandidate(candidates)
+	if bestCandidate == nil || len(bestCandidate.Name()) == 0 {
+		return nil, framework.NewStatus(framework.Unschedulable)
+	}
+
+	// 5) Perform preparation work before nominating the selected candidate.
+	// 将victim pods删除，将优先级更低的正在抢占的pods清除。
+	if status := ev.prepareCandidate(bestCandidate, pod, ev.PluginName); !status.IsSuccess() {
+		return nil, status
+	}
+
+	return framework.NewPostFilterResultWithNominatedNode(bestCandidate.Name()), framework.NewStatus(framework.Success)
+}
+```
+
+文中代码部分比较粗略，因为实际内容比较多，不好一一展开，我在这讲解下大体流程，感兴趣的读者可以自行去阅读，相信你也能体验到，反复阅读，慢慢揭开调度器面纱的那种好奇满足感，就像阅读一部优秀的推理小说，当你带着疑问，慢慢理清各种线索，最后得到答案的时候，内心是非常满足愉悦的。
+
+
+### References
+
+[调度，抢占和驱逐](https://kubernetes.io/zh/docs/concepts/scheduling-eviction/)
+
+[https://github.com/kubernetes/enhancements](https://github.com/kubernetes/enhancements)
 
