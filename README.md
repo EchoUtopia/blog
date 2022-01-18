@@ -1,3 +1,5 @@
+## [k8s scheduler初探(2022/1/18)](./k8s_scheduler/scheduler.md)
+
 ## [boltdb原理探究](./bolt/boltdb.md)
 
 ## [通用资源池设计思考](./generic_resource_pool.md)
