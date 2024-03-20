@@ -38,7 +38,7 @@ https://stackoverflow.com/questions/77355636/close-wait-tcp-states-despite-close
 
 所以，现在我们有充分的理由怀疑程序没有去调用accept。
 
-于是从这个方向着手排查问题，让应用dump出jstack，我对java不是很了解，但是从程序没有accept这个角度排查，很快就找到原因了，查出了健康检查端口是有一个线程在accept，但是应用服务端口没有找到对应的端口，然后再找一个正常的应用pod导出jstack，能够看到应用服务端口也是有一个线程在accept，这就说明，就是应用代码写的有问题导致accept线程消失了。
+于是从这个方向着手排查问题，让应用dump出jstack，我对java不是很了解，但是从程序没有accept这个角度排查，很快就找到原因了，查出了健康检查端口是有一个线程在accept，但是应用服务端口没有找到对应的accept线程，然后再找一个正常的应用pod导出jstack，能够看到应用服务端口也是有一个线程在accept，这就说明，就是应用代码写的有问题导致accept线程消失了。
 
 让他们去排查吧，咱们的任务完成了。
 
