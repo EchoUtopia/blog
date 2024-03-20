@@ -1,0 +1,58 @@
+# 记一次奇怪的应用无法连接的问题排查
+一大早，用户反馈应用接口时不时出现报错，排查前端nginx日志，发现有连接后端服务超时的情况。
+
+我们的应用情况是前端nginx通过service连接的后端pod服务，进一步排查只有一个pod连不上，另外两个pod都正常。
+
+直连这个pod发现确实连不上，为了尽快恢复服务正常，领导让重启前后端pod，我们为了保留现场，更改了这个pod的标签，让service的selector和该故障pod match不上，被移除endpoint，服务恢复正常，现场也得以保留。
+
+于是开始摩拳擦掌来看看这是个什么问题，能遇到什么奇怪的妖魔鬼怪。
+
+Netstat -nlp 可以看到端口正常监听，但实际本来这里一眼就能看出问题的，由于笔者知识储备太薄弱，完全没看出来，就继续排查了。
+
+那就抓包看吧，从客户端这边看来，三次握手是成功了的，但是给服务端发的http请求一直没有收到ack，导致一直重试，重试期间居然又收到服务端的三次握手的syn+ack。然后后面收到服务端的rst。
+
+这个就奇怪了，也就是说，客户端认为三次握手已经成功了，服务端却认为握手没有完成，因为他没收到客户端的最后一个ack。
+
+在服务端抓包，看到的的确如此。
+
+经过一番资料查询，原来是accept队列满了导致的。
+
+当服务端收到客户端的握手syn包时，服务端首先将该链接信息存入syn队列，并发送syn+ack，后续如果收到了客户端的ack时，连接握手完成，服务端将该连接存入accept队列，此时程序调用accpet时，就是从该队列pop出连接。
+
+但是如果sync队列中的连接收到了客户端三次握手的最后一个ack准备存入accept队列却发现accept队列满了时，服务端可能采取两种行为：
+
+0，丢弃客户端发送的ack包。
+1，直接发送rst包。
+
+该行为被
+/proc/sys/net/ipv4/tcp_abort_on_overflow参数控制，为0时，直接丢弃ack包，为1时，直接发送rst。
+默认为0.
+
+所以三次握手客户端发送的最后一个ack被丢弃了，导致服务端看来三次握手没完成，并重试发送syn+ack。
+
+
+这个时候回头在看：ss -nlt，可以看到出问题的监听端口的recv-q不为0，意思就是accept队列中存在连接等待被accept，正常写服务端程序的都知道，一般accept都在一个循环里面，是比较轻量的操作，很快的，所以recv-q正常都是0.
+
+这里有个很棒的回答，可以通过这个简单的实验复现该问题。
+https://stackoverflow.com/questions/77355636/close-wait-tcp-states-despite-closed-file-descriptors> 
+
+所以，现在我们有充分的理由怀疑程序没有去调用accept。
+
+于是从这个方向着手排查问题，让应用dump出jstack，我对java不是很了解，但是从程序没有accept这个角度排查，很快就找到原因了，查出了健康检查端口是有一个线程在accept，但是应用服务端口没有找到对应的端口，然后再找一个正常的应用pod导出jstack，能够看到应用服务端口也是有一个线程在accept，这就说明，就是应用代码写的有问题导致accept线程消失了。
+
+让他们去排查吧，咱们的任务完成了。
+
+另外在排查过程中发现一个有趣的现象，在服务端执行ss -nt发现，有很多处在close-wait状态的连接，并且这些连接的对端ip（pod网段）的pod早已不存在。
+通过tcp状态机可以知道，当客户端主动断开连接发送fin，服务端收到fin后就进入close-wait状态并发送fin的ack。后续如果没有要发送的数据，服务端调用连接的close方法，给客户端发送fin，进入last-ack状态，等客户端发送最后一个ack后，连接正式关闭。
+
+在本次情况下，可以看到这些连接并没有文件描述符，正常accept后的连接会有一个连接描述符，如果是忘记close，是可以看到连接的描述符的。
+
+那到底是什么原因导致这些close-wait的连接一直存在呢？
+
+因为服务端停止accept连接，但是客户端是可以正常与服务端完成握手，握手完成后，客户端开始发送数据，等后面断开连接后，给服务端发送fin，此时服务端进入close-wait状态，因为服务端程序没有accept，所以没法调用close给客户端发送fin，这些连接也没有对应的文件描述符了。
+
+references：
+
+https://www.alibabacloud.com/blog/tcp-syn-queue-and-accept-queue-overflow-explained_599203
+https://stackoverflow.com/questions/77355636/close-wait-tcp-states-despite-closed-file-descriptors> 
+
